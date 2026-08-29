@@ -46,7 +46,7 @@ public:
 private:
     void StopAndCleanup();
     std::optional<Response> RequireStopped(const char* action) const;
-    void SendColors() const;
+    void SendColors(const std::vector<std::byte>& buffer) const;
     void SendLoop();
     void AddHeaderToBuffer();
 

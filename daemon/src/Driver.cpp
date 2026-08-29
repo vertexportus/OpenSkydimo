@@ -381,14 +381,23 @@ void Driver::SendLoop()
 {
     using clock = std::chrono::steady_clock;
 
+    std::vector<std::byte> frame;
+
     while (m_isConnectionOpened)
     {
         const auto next = clock::now() + m_sendInterval;
 
-        try
+        // Only hold the mutex long enough to snapshot the buffer, then write the
+        // copy lock-free. This keeps effect commands (which take the same mutex)
+        // from stalling behind the blocking serial write.
         {
             std::lock_guard lock(m_bufferMutex);
-            SendColors();
+            frame = m_buffer;
+        }
+
+        try
+        {
+            SendColors(frame);
         }
         catch (const SerialWriteException& e)
         {
@@ -401,16 +410,16 @@ void Driver::SendLoop()
     }
 }
 
-void Driver::SendColors() const
+void Driver::SendColors(const std::vector<std::byte>& buffer) const
 {
-    m_logger->debug("Sending {} bytes to '{}'", m_buffer.size(), m_portName);
+    m_logger->debug("Sending {} bytes to '{}'", buffer.size(), m_portName);
 
     size_t totalWritten = 0;
-    const auto* data = reinterpret_cast<const char*>(m_buffer.data());
+    const auto* data = reinterpret_cast<const char*>(buffer.data());
 
-    while (totalWritten < m_buffer.size())
+    while (totalWritten < buffer.size())
     {
-        const ssize_t bytesWritten = write(m_serialPort, data + totalWritten, m_buffer.size() - totalWritten);
+        const ssize_t bytesWritten = write(m_serialPort, data + totalWritten, buffer.size() - totalWritten);
 
         if (bytesWritten < 0)
         {
@@ -425,6 +434,19 @@ void Driver::SendColors() const
             throw SerialWriteException(std::format("write() returned 0 unexpectedly on '{}'", m_portName));
 
         totalWritten += static_cast<size_t>(bytesWritten);
+    }
+
+    // Block until the kernel has actually transmitted the frame before returning.
+    // This throttles the send loop to the serial link's real drain rate, so it can
+    // never queue frames faster than the device consumes them (no buffer
+    // saturation / oversubscription, regardless of the configured refresh rate).
+    while (tcdrain(m_serialPort) == -1)
+    {
+        if (errno == EINTR)
+            continue;
+
+        m_logger->debug("tcdrain failed on '{}': {} (errno: {})", m_portName, strerror(errno), errno);
+        break;
     }
 
     m_logger->debug("Sent {} bytes successfully", totalWritten);
