@@ -46,6 +46,8 @@ public:
 private:
     void StopAndCleanup();
     std::optional<Response> RequireStopped(const char* action) const;
+    Response OpenPort();
+    bool Reconnect();
     void SendColors(const std::vector<std::byte>& buffer) const;
     void SendLoop();
     void AddHeaderToBuffer();

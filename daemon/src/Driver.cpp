@@ -275,6 +275,18 @@ Response Driver::OpenSerialConnection()
 
     StopAndCleanup();
 
+    if (auto [code, message] = OpenPort(); code != 0)
+        return {code, message};
+
+    m_isConnectionOpened = true;
+    m_sendThread = std::thread(&Driver::SendLoop, this);
+    m_logger->info("Send thread started at ~{} Hz", 1'000'000 / m_sendInterval.count());
+
+    return MakeOk();
+}
+
+Response Driver::OpenPort()
+{
     m_logger->info("Opening serial connection on port '{}'", m_portName);
 
     if (m_portName.empty())
@@ -355,11 +367,46 @@ Response Driver::OpenSerialConnection()
     m_logger->info("Serial connection established on '{}' at {} baud, ready to send to {} LEDs", m_portName, m_baudRate,
                    m_ledCount);
 
-    m_isConnectionOpened = true;
-    m_sendThread = std::thread(&Driver::SendLoop, this);
-    m_logger->info("Send thread started at ~{} Hz", 1'000'000 / m_sendInterval.count());
-
     return MakeOk();
+}
+
+bool Driver::Reconnect()
+{
+    if (m_serialPort >= 0)
+    {
+        close(m_serialPort);
+        m_serialPort = -1;
+    }
+
+    auto backoff = std::chrono::milliseconds(200);
+    constexpr auto maxBackoff = std::chrono::milliseconds(5000);
+
+    while (m_isConnectionOpened)
+    {
+        m_logger->warn("Serial link down; reopening '{}' in {} ms", m_portName, backoff.count());
+
+        // Interruptible backoff so a concurrent stop stays responsive.
+        const auto deadline = std::chrono::steady_clock::now() + backoff;
+        while (m_isConnectionOpened && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        if (!m_isConnectionOpened)
+            break;
+
+        if (auto [code, message] = OpenPort(); code == 0)
+        {
+            m_logger->info("Serial link to '{}' restored; resuming send loop", m_portName);
+            return true;
+        }
+        else
+        {
+            m_logger->warn("Reconnect attempt failed: {}", message);
+        }
+
+        backoff = std::min(backoff * 2, maxBackoff);
+    }
+
+    return false;
 }
 
 Response Driver::CloseSerialConnection()
@@ -402,8 +449,12 @@ void Driver::SendLoop()
         catch (const SerialWriteException& e)
         {
             m_logger->error("Send loop write error: {}", e.what());
-            m_isConnectionOpened = false;
-            break;
+
+            // A transient serial/USB glitch (e.g. a one-off EIO) must not kill the
+            // driver for good. Drop the bad fd, reopen the port with backoff, and
+            // resume streaming so the strip recovers without a manual restart.
+            if (!Reconnect())
+                break;
         }
 
         std::this_thread::sleep_until(next);
